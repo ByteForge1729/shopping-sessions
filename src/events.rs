@@ -121,6 +121,11 @@ pub fn load(dir: &Path, lk: &Lookups, threads: usize) -> Vec<Vec<Vec<Ev>>> {
         threads,
         || vec![Vec::<Copy>::new(); PARTS],
         |out, i| {
+            // about 75 bytes per line, spread evenly over the partitions
+            let expect = chunks[i].len() / 75 / PARTS + 8;
+            for v in out.iter_mut() {
+                v.reserve(expect);
+            }
             csv::records::<7>(chunks[i], |f| {
                 if let Some(copy) = parse_fields(f, lk) {
                     out[data::part(copy.eid)].push(copy);
@@ -135,6 +140,7 @@ pub fn load(dir: &Path, lk: &Lookups, threads: usize) -> Vec<Vec<Vec<Ev>>> {
         || vec![Vec::<Ev>::new(); PARTS],
         |out, p| {
             let lists: Vec<&[Copy]> = parsed.iter().map(|t| &t[p][..]).collect();
+            reserve(out, lists.iter().map(|l| l.len()).sum());
             for at in earliest_copies(&lists) {
                 emit(&lists[(at >> 24) as usize][(at & 0xFF_FFFF) as usize], out);
             }
@@ -143,6 +149,14 @@ pub fn load(dir: &Path, lk: &Lookups, threads: usize) -> Vec<Vec<Vec<Ev>>> {
 }
 
 const EMPTY: u32 = u32::MAX;
+
+/// Room for `n` more items spread evenly over the partitions.
+pub fn reserve<T>(out: &mut [Vec<T>], n: usize) {
+    let each = n / out.len() + n / (4 * out.len()) + 8;
+    for v in out.iter_mut() {
+        v.reserve(each);
+    }
+}
 
 /// (list << 24 | index) of the earliest-ingested copy of every distinct event ID,
 /// from an open-addressing table keyed by the ID hash (its low bits; the partition
@@ -196,6 +210,7 @@ pub fn resolve(by_user: &[Vec<Vec<Ev>>], people: &People, threads: usize) -> Vec
         threads,
         || vec![Vec::<Ev>::new(); PARTS],
         |out, u| {
+            reserve(out, by_user.iter().map(|w| w[u].len()).sum());
             for worker in by_user {
                 for e in &worker[u] {
                     let (person, name) = people.person(e.person, e.name.get());

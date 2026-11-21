@@ -40,6 +40,7 @@ pub fn load(dir: &Path, window: &Window, campaigns: &Table, threads: usize) -> V
         threads,
         || vec![Vec::<Click>::new(); PARTS],
         |out, i| {
+            crate::events::reserve(out, chunks[i].len() / 45);
             csv::records::<4>(chunks[i], |f| {
                 if let Some((user, _, mut click)) = parse_fields(f, window, campaigns) {
                     click.person = user;
@@ -57,6 +58,7 @@ pub fn resolve(by_user: &[Vec<Vec<Click>>], people: &People, threads: usize) -> 
         threads,
         || vec![Vec::<Click>::new(); PARTS],
         |out, u| {
+            crate::events::reserve(out, by_user.iter().map(|w| w[u].len()).sum());
             for worker in by_user {
                 for c in &worker[u] {
                     let person = people.person(c.person, &[]).0;
