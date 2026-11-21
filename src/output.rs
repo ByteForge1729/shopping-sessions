@@ -41,8 +41,9 @@ enum Column {
     Int64(Vec<i64>),
 }
 
-fn bytes(b: &[u8]) -> ByteArray {
-    ByteArray::from(b.to_vec())
+/// A Parquet byte array that borrows the 'static input bytes (no copy).
+fn bytes(b: &'static [u8]) -> ByteArray {
+    ByteArray::from(::bytes::Bytes::from_static(b))
 }
 
 fn write(path: &Path, schema: &str, columns: Vec<Column>) -> Result<()> {
@@ -103,7 +104,7 @@ pub fn write_campaigns(path: &Path, counts: &[CampaignDay], d: &Dims, ids: &[Byt
             if cd[0] == 0 && cd[3] == 0 {
                 continue;
             }
-            let (name, chan): (&[u8], &[u8]) = if c == ids.len() { (b"organic", b"organic") } else { (ids[c], channels[c]) };
+            let (name, chan): (Bytes, Bytes) = if c == ids.len() { (b"organic", b"organic") } else { (ids[c], channels[c]) };
             id.push(bytes(name));
             channel.push(bytes(chan));
             day.push((d.first_day + di as i64) as i32);
