@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use crate::csv;
-use crate::data::{self, Bytes, Table, Window, PARTS};
+use crate::data::{self, Bytes, Ref, Table, Window, PARTS};
 use crate::links::People;
 use crate::ts;
 
@@ -15,7 +15,7 @@ pub struct Click {
     pub person: u64,
     pub ts: i64,
     pub campaign: u16,
-    pub id: Bytes,
+    pub id: Ref,
 }
 
 #[inline]
@@ -29,7 +29,7 @@ fn parse_fields(f: [Bytes; 4], window: &Window, campaigns: &Table) -> Option<(u6
         return None;
     }
     let campaign = campaigns.get(campaign)?;
-    Some((data::h64(user), user, Click { person: 0, ts: t, campaign, id }))
+    Some((data::h64(user), user, Click { person: 0, ts: t, campaign, id: Ref::new(id) }))
 }
 
 /// Every valid click, per worker, split into `PARTS` user partitions (see [`resolve`]).
@@ -59,7 +59,7 @@ pub fn resolve(by_user: &[Vec<Vec<Click>>], people: &People, threads: usize) -> 
         |out, u| {
             for worker in by_user {
                 for c in &worker[u] {
-                    let person = people.person(c.person, c.id).0;
+                    let person = people.person(c.person, &[]).0;
                     out[data::part(person)].push(Click { person, ..*c });
                 }
             }

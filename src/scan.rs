@@ -9,9 +9,9 @@
 
 const BLOCK: usize = 64;
 
-/// (separator mask, quote mask) for 64 bytes.
+/// (separator mask, newline mask, quote mask) for 64 bytes.
 #[inline(always)]
-fn masks(b: &[u8; BLOCK]) -> (u64, u64) {
+fn masks(b: &[u8; BLOCK]) -> (u64, u64, u64) {
     #[cfg(target_arch = "x86_64")]
     {
         sse2(b)
@@ -27,36 +27,39 @@ fn masks(b: &[u8; BLOCK]) -> (u64, u64) {
 }
 
 #[allow(dead_code)]
-fn scalar(b: &[u8; BLOCK]) -> (u64, u64) {
-    let (mut sep, mut quote) = (0u64, 0u64);
+fn scalar(b: &[u8; BLOCK]) -> (u64, u64, u64) {
+    let (mut sep, mut nl, mut quote) = (0u64, 0u64, 0u64);
     for (i, &c) in b.iter().enumerate() {
         sep |= ((c == b',' || c == b'\n') as u64) << i;
+        nl |= ((c == b'\n') as u64) << i;
         quote |= ((c == b'"') as u64) << i;
     }
-    (sep, quote)
+    (sep, nl, quote)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn sse2(b: &[u8; BLOCK]) -> (u64, u64) {
+fn sse2(b: &[u8; BLOCK]) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     // SSE2 is part of every x86_64 CPU.
     unsafe {
         let (comma, nl, q) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
-        let (mut sep, mut quote) = (0u64, 0u64);
+        let (mut sep, mut lines, mut quote) = (0u64, 0u64, 0u64);
         for k in 0..4 {
             let v = _mm_loadu_si128(b.as_ptr().add(16 * k) as *const __m128i);
-            let s = _mm_or_si128(_mm_cmpeq_epi8(v, comma), _mm_cmpeq_epi8(v, nl));
+            let n = _mm_cmpeq_epi8(v, nl);
+            let s = _mm_or_si128(_mm_cmpeq_epi8(v, comma), n);
             sep |= (_mm_movemask_epi8(s) as u16 as u64) << (16 * k);
+            lines |= (_mm_movemask_epi8(n) as u16 as u64) << (16 * k);
             quote |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, q)) as u16 as u64) << (16 * k);
         }
-        (sep, quote)
+        (sep, lines, quote)
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn neon(b: &[u8; BLOCK]) -> (u64, u64) {
+fn neon(b: &[u8; BLOCK]) -> (u64, u64, u64) {
     use std::arch::aarch64::*;
     unsafe {
         let weights: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
@@ -66,13 +69,15 @@ fn neon(b: &[u8; BLOCK]) -> (u64, u64) {
             (vaddv_u8(vget_low_u8(x)) as u64) | ((vaddv_u8(vget_high_u8(x)) as u64) << 8)
         };
         let (comma, nl, q) = (vdupq_n_u8(b','), vdupq_n_u8(b'\n'), vdupq_n_u8(b'"'));
-        let (mut sep, mut quote) = (0u64, 0u64);
+        let (mut sep, mut lines, mut quote) = (0u64, 0u64, 0u64);
         for k in 0..4 {
             let v = vld1q_u8(b.as_ptr().add(16 * k));
-            sep |= bits(vorrq_u8(vceqq_u8(v, comma), vceqq_u8(v, nl))) << (16 * k);
+            let n = vceqq_u8(v, nl);
+            sep |= bits(vorrq_u8(vceqq_u8(v, comma), n)) << (16 * k);
+            lines |= bits(n) << (16 * k);
             quote |= bits(vceqq_u8(v, q)) << (16 * k);
         }
-        (sep, quote)
+        (sep, lines, quote)
     }
 }
 
@@ -103,7 +108,9 @@ impl<'a, const N: usize> Line<'a, N> {
         if n >= N {
             return;
         }
-        let v = &data[start..end];
+        debug_assert!(start <= end && end <= data.len());
+        // SAFETY: separators are visited in order, so start <= end <= data.len().
+        let v = unsafe { data.get_unchecked(start..end) };
         self.fields[n] = if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
             self.wrapped += 1;
             &v[1..v.len() - 1]
@@ -131,7 +138,7 @@ pub fn records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; 
     let mut base = 0usize;
     let mut tail = [0u8; BLOCK];
     while base < data.len() {
-        let (sep, quote) = if base + BLOCK <= data.len() {
+        let (sep, lines, quote) = if base + BLOCK <= data.len() {
             masks(data[base..base + BLOCK].try_into().unwrap())
         } else {
             let n = data.len() - base;
@@ -146,9 +153,8 @@ pub fn records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; 
             bits &= bits - 1;
             line.quotes += (quote & below(i) & !below(done)).count_ones();
             done = i + 1;
-            let pos = base + i as usize;
-            line.field(data, pos);
-            if data[pos] == b'\n' {
+            line.field(data, base + i as usize);
+            if (lines >> i) & 1 != 0 {
                 line.finish(&mut f);
             }
         }

@@ -46,12 +46,55 @@ fn civil(b: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, mo, d) * MS_PER_DAY + ((h * 60 + mi) * 60 + s) * 1000)
 }
 
+/// Cumulative days before each month (non-leap year), index 1..=12.
+const BEFORE_MONTH: [i64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+/// F1 for years 1970..=2399 via one SWAR digit check; None hands the bytes to
+/// `civil`, which decides every case this skips.
+#[inline]
+fn fast_f1(b: &[u8]) -> Option<i64> {
+    let lo = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
+    let hi = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
+    let digits_lo = lo.wrapping_sub(0x2D30_302D_3030_3030); // "0000-00-" layout
+    let digits_hi = hi.wrapping_sub(0x3030_3A30_3054_3030); // "00T00:00" layout
+    // every digit byte must now be 0..=9 and the punctuation exactly 0
+    const DIGITS_LO: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const DIGITS_HI: u64 = 0xFFFF_00FF_FF00_FFFF;
+    let bad = |v: u64, digit: u64| -> bool {
+        (v & !digit) != 0 || ((v | v.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 & digit) != 0
+    };
+    if bad(digits_lo, DIGITS_LO) || bad(digits_hi, DIGITS_HI) || b[16] != b':' {
+        return None;
+    }
+    let d = |v: u64, i: u32| ((v >> (8 * i)) & 0xFF) as i64;
+    let y = d(digits_lo, 0) * 1000 + d(digits_lo, 1) * 100 + d(digits_lo, 2) * 10 + d(digits_lo, 3);
+    let mo = d(digits_lo, 5) * 10 + d(digits_lo, 6);
+    let day = d(digits_hi, 0) * 10 + d(digits_hi, 1);
+    let h = d(digits_hi, 3) * 10 + d(digits_hi, 4);
+    let mi = d(digits_hi, 6) * 10 + d(digits_hi, 7);
+    let (s1, s2) = (b[17].wrapping_sub(b'0'), b[18].wrapping_sub(b'0'));
+    if s1 > 9 || s2 > 9 || !(1970..=2399).contains(&y) || !(1..=12).contains(&mo) || h > 23 || mi > 59 {
+        return None;
+    }
+    let s = (s1 * 10 + s2) as i64;
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    if s > 59 || day < 1 || day > days_in_month(y, mo) {
+        return None;
+    }
+    let yd = y - 1970;
+    let days = yd * 365 + (yd + 1) / 4 - (yd + 69) / 100 + (yd + 369) / 400 + BEFORE_MONTH[mo as usize]
+        + (mo > 2 && leap) as i64
+        + day
+        - 1;
+    Some(days * MS_PER_DAY + ((h * 60 + mi) * 60 + s) * 1000)
+}
+
 /// Parse any of the three forms. F3 values too large for i64 are None (they are
 /// outside every window anyway).
 #[inline]
 pub fn parse(b: &[u8]) -> Option<i64> {
     match b.len() {
-        20 if b[19] == b'Z' => civil(b),
+        20 if b[19] == b'Z' => fast_f1(b).or_else(|| civil(b)),
         25 if b[19] == b'+' || b[19] == b'-' => {
             if b[22] != b':' {
                 return None;
@@ -97,6 +140,27 @@ mod tests {
         assert_eq!(parse(b"1791071890000"), Some(f1));
         assert_eq!(parse(b"0001791071890000"), Some(f1));
         assert_eq!(parse(b"2026-10-03T23:58:10-00:00"), Some(f1));
+    }
+
+    #[test]
+    fn fast_path_agrees_with_civil() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let y = 1970 + state % 430;
+            let mo = 1 + (state >> 9) % 13;
+            let d = (state >> 13) % 32;
+            let (h, mi, s) = ((state >> 18) % 25, (state >> 23) % 61, (state >> 29) % 61);
+            let text = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
+            let b = text.as_bytes();
+            if let Some(v) = fast_f1(b) {
+                assert_eq!(Some(v), civil(b), "{text}");
+            } else {
+                assert_eq!(civil(b).filter(|_| (1970..=2399).contains(&(y as i64))), None, "{text}");
+            }
+        }
     }
 
     #[test]

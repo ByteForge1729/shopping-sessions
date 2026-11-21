@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use crate::csv;
-use crate::data::{self, Bytes, Table, Window, PARTS};
+use crate::data::{self, Bytes, Ref, Table, Window, PARTS};
 use crate::links::People;
 use crate::ts;
 
@@ -22,7 +22,7 @@ pub struct Ev {
     pub price: u32,
     pub cat: u16,
     pub kind: u8,
-    pub name: Bytes,
+    pub name: Ref,
 }
 
 /// One parsed copy of an event, valid or not (validity is decided on the kept copy).
@@ -36,8 +36,8 @@ struct Copy {
     cat: u16,
     kind: u8,
     ok: bool,
-    eid_bytes: Bytes,
-    user_bytes: Bytes,
+    eid_bytes: Ref,
+    user_bytes: Ref,
 }
 
 pub struct Lookups<'a> {
@@ -72,8 +72,8 @@ fn parse_fields(f: [Bytes; 7], lk: &Lookups) -> Option<Copy> {
         cat: 0,
         kind: 0,
         ok: false,
-        eid_bytes: eid,
-        user_bytes: user,
+        eid_bytes: Ref::new(eid),
+        user_bytes: Ref::new(user),
     };
     let Some(t) = ts::parse(ts_b) else { return Some(copy) };
     let Some(kind) = kind_of(kind_b) else { return Some(copy) };
@@ -162,7 +162,7 @@ fn earliest_copies(flat: &[&Copy]) -> Vec<u32> {
             }
             if slot.0 == c.eid {
                 let kept = flat[slot.1 as usize];
-                if kept.eid_bytes == c.eid_bytes {
+                if kept.eid_bytes == c.eid_bytes || kept.eid_bytes.get() == c.eid_bytes.get() {
                     if c.ingest < kept.ingest {
                         slot.1 = i as u32;
                     }
@@ -192,8 +192,8 @@ pub fn resolve(by_user: &[Vec<Vec<Ev>>], people: &People, threads: usize) -> Vec
         |out, u| {
             for worker in by_user {
                 for e in &worker[u] {
-                    let (person, name) = people.person(e.person, e.name);
-                    out[data::part(person)].push(Ev { person, name, ..*e });
+                    let (person, name) = people.person(e.person, e.name.get());
+                    out[data::part(person)].push(Ev { person, name: Ref::new(name), ..*e });
                 }
             }
         },

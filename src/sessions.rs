@@ -108,7 +108,7 @@ impl Worker {
 
     fn person(&mut self, d: &Dims, evs: &[Ev], clicks: &[Click]) {
         let organic = d.campaigns;
-        let mut row = UserRow { name: evs[0].name, day: i32::MIN, sessions: 0, events: 0, revenue: 0, top: 0 };
+        let mut row = UserRow { name: evs[0].name.get(), day: i32::MIN, sessions: 0, events: 0, revenue: 0, top: 0 };
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut i = 0;
         while i < evs.len() {
@@ -186,7 +186,7 @@ pub fn run(events: &[Vec<Vec<Ev>>], clicks: &[Vec<Vec<Click>>], d: &Dims, thread
             let mut evs: Vec<Ev> = events.iter().flat_map(|t| t[q].iter().copied()).collect();
             evs.sort_unstable_by_key(|e| (e.person, e.ts));
             let mut cl: Vec<Click> = clicks.iter().flat_map(|t| t[q].iter().copied()).collect();
-            cl.sort_unstable_by(|a, b| (a.person, a.ts, a.id).cmp(&(b.person, b.ts, b.id)));
+            cl.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.get().cmp(b.id.get())));
             let (mut i, mut c) = (0, 0);
             while i < evs.len() {
                 let person = evs[i].person;
