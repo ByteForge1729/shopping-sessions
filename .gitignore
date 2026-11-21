@@ -1,0 +1,10 @@
+target/
+work/
+out/
+docs/x/
+docs/downloads/
+.DS_Store
+.vscode/
+__pycache__/
+.env*
+!.env.example

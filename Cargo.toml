@@ -1,0 +1,17 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Exact click-stream sessionization and campaign attribution (Builders Buildathon, Shopping Sessions track)"
+
+[dependencies]
+memmap2 = "0.9"
+parquet = { version = "54", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
