@@ -9,6 +9,7 @@ mod data;
 mod events;
 mod links;
 mod output;
+mod scan;
 mod sessions;
 mod ts;
 

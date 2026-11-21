@@ -128,7 +128,13 @@ impl<'a, const N: usize> Line<'a, N> {
 /// lines, header skipped). One SIMD scan finds every `\n`, `,` and `"`; a field is
 /// valid unquoted (no quote at all) or wrapped in exactly one pair of quotes.
 #[inline]
-pub fn records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+pub fn records<'a, const N: usize>(data: &'a [u8], f: impl FnMut([&'a [u8]; N])) {
+    crate::scan::records::<N>(data, f)
+}
+
+/// The previous scanner (memchr3 over every separator and quote), kept as a reference.
+#[allow(dead_code)]
+pub fn records_memchr<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let mut line = Line::<N>::new();
     for pos in memchr::memchr3_iter(b'\n', b',', b'"', data) {
         match data[pos] {
@@ -146,7 +152,7 @@ pub fn records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; 
             }
         }
     }
-    if line.start < data.len() {
+    if data.last().is_some_and(|&b| b != b'\n') {
         line.close(data, data.len());
         line.finish(&mut f);
     }
