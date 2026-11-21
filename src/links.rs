@@ -6,7 +6,6 @@
 //! and the result is one small map per partition of user-ID hashes, so a stage that
 //! works on one partition only touches a map that fits in cache.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::csv;
@@ -27,16 +26,9 @@ impl People {
         self.shards[data::part(user_hash)].get(&user_hash).copied().unwrap_or((user_hash, user))
     }
 
-    pub fn build(dir: &Path, threads: usize) -> People {
-        let chunks = data::load_dir(dir, 1 << 20);
-        let parsed = data::par_for(chunks.len(), threads, Parsed::new, |out, i| {
-            csv::records::<2>(chunks[i], |[a, b]| {
-                if !a.is_empty() && !b.is_empty() {
-                    out.add(a, b);
-                }
-            });
-        });
-        let ids = intern(&parsed, threads);
+    /// Join every worker's parsed link lines into people.
+    pub fn build(parsed: &[&Parsed], threads: usize) -> People {
+        let ids = intern(parsed, threads);
         let total = ids.base[PARTS] as usize;
         let parent: Vec<AtomicU32> = (0..total as u32).map(AtomicU32::new).collect();
         data::par_for(parsed.len(), threads, || (), |_, t| {
@@ -77,14 +69,22 @@ impl People {
 }
 
 /// One worker's link lines: ID hashes per partition (with their bytes) and pairs.
-struct Parsed {
+pub struct Parsed {
     ids: Vec<Vec<(u64, Bytes)>>,
     pairs: Vec<(u64, u64)>,
 }
 
 impl Parsed {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Parsed { ids: vec![Vec::new(); PARTS], pairs: Vec::new() }
+    }
+
+    pub fn chunk(&mut self, chunk: Bytes) {
+        csv::records::<2>(chunk, |[a, b]| {
+            if !a.is_empty() && !b.is_empty() {
+                self.add(a, b);
+            }
+        });
     }
 
     fn add(&mut self, a: Bytes, b: Bytes) {
@@ -110,7 +110,7 @@ impl Ids {
     }
 }
 
-fn intern(parsed: &[Parsed], threads: usize) -> Ids {
+fn intern(parsed: &[&Parsed], threads: usize) -> Ids {
     let per_part = data::par_for(PARTS, threads, Vec::new, |out: &mut Vec<(usize, FastMap<u32>, Vec<Bytes>)>, p| {
         let mut map = FastMap::default();
         let mut names = Vec::new();

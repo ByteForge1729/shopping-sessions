@@ -1,8 +1,6 @@
 //! Events: parse, dedup on `event_id` (earliest `ingest_ts` wins, before validation),
 //! validate and drop late events, then hand the survivors on grouped by person.
 
-use std::path::Path;
-
 use crate::csv;
 use crate::data::{self, Bytes, Ref, Table, Window, PARTS};
 use crate::links::People;
@@ -111,35 +109,33 @@ fn price(b: &[u8]) -> Option<u32> {
     (1..=MAX_PRICE).contains(&value).then_some(value as u32)
 }
 
-/// Parse, dedup and validate every event; returns, per worker, the survivors split
-/// into `PARTS` user partitions (see [`resolve`]).
-pub fn load(dir: &Path, lk: &Lookups, threads: usize) -> Vec<Vec<Vec<Ev>>> {
-    let clock = std::time::Instant::now();
-    let chunks = data::load_dir(dir, 4 << 20);
-    let parsed = data::par_for(
-        chunks.len(),
-        threads,
-        || vec![Vec::<Copy>::new(); PARTS],
-        |out, i| {
-            // about 75 bytes per line, spread evenly over the partitions
-            let expect = chunks[i].len() / 75 / PARTS + 8;
-            for v in out.iter_mut() {
-                v.reserve(expect);
+/// One worker's parsed event copies, split into `PARTS` partitions by event ID.
+pub struct Parsed(Vec<Vec<Copy>>);
+
+impl Parsed {
+    pub fn new() -> Self {
+        Parsed(vec![Vec::new(); PARTS])
+    }
+
+    pub fn chunk(&mut self, chunk: Bytes, lk: &Lookups) {
+        reserve(&mut self.0, chunk.len() / 75); // about 75 bytes per line
+        csv::records::<7>(chunk, |f| {
+            if let Some(copy) = parse_fields(f, lk) {
+                self.0[data::part(copy.eid)].push(copy);
             }
-            csv::records::<7>(chunks[i], |f| {
-                if let Some(copy) = parse_fields(f, lk) {
-                    out[data::part(copy.eid)].push(copy);
-                }
-            });
-        },
-    );
-    eprintln!("   events parsed in {:.3}s", clock.elapsed().as_secs_f64());
+        });
+    }
+}
+
+/// Dedup and validate every event; returns, per worker, the survivors split into
+/// `PARTS` user partitions (see [`resolve`]).
+pub fn dedup(parsed: &[&Parsed], threads: usize) -> Vec<Vec<Vec<Ev>>> {
     data::par_for(
         PARTS,
         threads,
         || vec![Vec::<Ev>::new(); PARTS],
         |out, p| {
-            let lists: Vec<&[Copy]> = parsed.iter().map(|t| &t[p][..]).collect();
+            let lists: Vec<&[Copy]> = parsed.iter().map(|t| &t.0[p][..]).collect();
             reserve(out, lists.iter().map(|l| l.len()).sum());
             for at in earliest_copies(&lists) {
                 emit(&lists[(at >> 24) as usize][(at & 0xFF_FFFF) as usize], out);

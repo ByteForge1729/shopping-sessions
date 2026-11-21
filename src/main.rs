@@ -18,6 +18,28 @@ use std::time::Instant;
 
 use data::Bytes;
 
+const CHUNK: usize = 4 << 20;
+
+#[derive(Clone, Copy)]
+enum Input {
+    Links,
+    Events,
+    Clicks,
+}
+
+/// One worker's share of every parsed input.
+struct Parsed {
+    links: links::Parsed,
+    events: events::Parsed,
+    clicks: clicks::Parsed,
+}
+
+impl Parsed {
+    fn new() -> Self {
+        Parsed { links: links::Parsed::new(), events: events::Parsed::new(), clicks: clicks::Parsed::new() }
+    }
+}
+
 fn dirs() -> (PathBuf, PathBuf) {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 {
@@ -36,19 +58,31 @@ fn main() {
     let window = data::window(&data_dir);
     let products = data::table(&data_dir.join("products.csv"));
     let campaigns = data::table(&data_dir.join("campaigns.csv"));
-    let people = links::People::build(&data_dir.join("links"), threads);
-    lap("links");
-
     let mut category_names: Vec<Bytes> = products.values.clone();
     let unknown_cat = category_names.len() as u16;
     category_names.push(b"unknown");
     let lookups = events::Lookups { window: &window, products: &products, unknown_cat };
-    let evs = events::load(&data_dir.join("events"), &lookups, threads);
-    lap("events");
-    let cls = clicks::load(&data_dir.join("clicks"), &window, &campaigns, threads);
-    lap("clicks");
+
+    // Every chunk of every input in one work list, largest first, so no worker
+    // waits at a stage boundary while another finishes a big file.
+    let mut work: Vec<(Input, Bytes)> = Vec::new();
+    for (input, dir) in [(Input::Links, "links"), (Input::Events, "events"), (Input::Clicks, "clicks")] {
+        work.extend(data::load_dir(&data_dir.join(dir), CHUNK).into_iter().map(|c| (input, c)));
+    }
+    work.sort_by_key(|w| std::cmp::Reverse(w.1.len()));
+    let parsed = data::par_for(work.len(), threads, Parsed::new, |p, i| match work[i] {
+        (Input::Links, c) => p.links.chunk(c),
+        (Input::Events, c) => p.events.chunk(c, &lookups),
+        (Input::Clicks, c) => p.clicks.chunk(c, &window, &campaigns),
+    });
+    lap("parsed");
+    let people = links::People::build(&parsed.iter().map(|p| &p.links).collect::<Vec<_>>(), threads);
+    lap("links");
+    let evs = events::dedup(&parsed.iter().map(|p| &p.events).collect::<Vec<_>>(), threads);
+    lap("dedup");
     let evs = events::resolve(&evs, &people, threads);
-    let cls = clicks::resolve(&cls, &people, threads);
+    let cls = clicks::resolve(&parsed.iter().map(|p| &p.clicks).collect::<Vec<_>>(), &people, threads);
+    drop(parsed);
     lap("people");
 
     let mut order: Vec<usize> = (0..category_names.len()).collect();
