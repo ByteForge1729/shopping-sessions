@@ -74,6 +74,84 @@ fn unquote(field: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// Field-splitting state for one line of [`records`].
+struct Line<'a, const N: usize> {
+    fields: [&'a [u8]; N],
+    count: usize,
+    bad: bool,
+    start: usize,
+    quotes: u32,
+    opened: bool,
+    last_quote: usize,
+}
+
+impl<'a, const N: usize> Line<'a, N> {
+    fn new() -> Self {
+        Line { fields: [&[]; N], count: 0, bad: false, start: 0, quotes: 0, opened: false, last_quote: 0 }
+    }
+
+    /// End the current field at `end` (exclusive); the next starts after it.
+    #[inline]
+    fn close(&mut self, data: &'a [u8], end: usize) {
+        if !self.bad {
+            let value = if self.quotes == 0 {
+                Some(&data[self.start..end])
+            } else if self.opened && self.quotes == 2 && self.last_quote + 1 == end && end - self.start >= 2 {
+                Some(&data[self.start + 1..end - 1])
+            } else {
+                None
+            };
+            match value {
+                Some(v) if self.count < N => {
+                    self.fields[self.count] = v;
+                    self.count += 1;
+                }
+                _ => self.bad = true,
+            }
+        }
+        self.start = end + 1;
+        self.quotes = 0;
+        self.opened = false;
+    }
+
+    #[inline]
+    fn finish(&mut self, f: &mut impl FnMut([&'a [u8]; N])) {
+        if !self.bad && self.count == N {
+            f(self.fields);
+        }
+        self.count = 0;
+        self.bad = false;
+    }
+}
+
+/// Call `f` with the `N` field values of every well-formed line in `data` (whole
+/// lines, header skipped). One SIMD scan finds every `\n`, `,` and `"`; a field is
+/// valid unquoted (no quote at all) or wrapped in exactly one pair of quotes.
+#[inline]
+pub fn records<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    let mut line = Line::<N>::new();
+    for pos in memchr::memchr3_iter(b'\n', b',', b'"', data) {
+        match data[pos] {
+            b'"' => {
+                if pos == line.start && line.quotes == 0 {
+                    line.opened = true;
+                }
+                line.quotes += 1;
+                line.last_quote = pos;
+            }
+            b',' => line.close(data, pos),
+            _ => {
+                line.close(data, pos);
+                line.finish(&mut f);
+            }
+        }
+    }
+    if line.start < data.len() {
+        line.close(data, data.len());
+        line.finish(&mut f);
+    }
+}
+
 /// Everything after the header line of a file (empty if the file has only a header).
 pub fn body(file: &[u8]) -> &[u8] {
     match memchr(b'\n', file) {
@@ -118,6 +196,23 @@ mod tests {
         assert!(fields::<2>(br#"u1,u5""#).is_none());
         assert!(fields::<2>(br#"a"b,c"#).is_none());
         assert!(fields::<2>(br#"""",c"#).is_none());
+    }
+
+    fn all<const N: usize>(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        records::<N>(data, |f| out.push(f.iter().map(|v| v.to_vec()).collect()));
+        out
+    }
+
+    #[test]
+    fn records_match_fields() {
+        let data: &[u8] = b"a,b\n\n\"u1\",\"\"\nu1,u5\"\nx\"y,z\nu1\n\"\"\"\",c\n p , q \r\nlast,line";
+        let expected: Vec<Vec<Vec<u8>>> = lines(data)
+            .filter_map(|l| fields::<2>(l))
+            .map(|f| f.iter().map(|v| v.to_vec()).collect())
+            .collect();
+        assert_eq!(all::<2>(data), expected);
+        assert_eq!(expected.len(), 4);
     }
 
     #[test]

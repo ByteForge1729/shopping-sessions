@@ -19,8 +19,8 @@ pub struct Click {
 }
 
 #[inline]
-fn parse_line(line: Bytes, window: &Window, campaigns: &Table) -> Option<(u64, Bytes, Click)> {
-    let [id, user, campaign, ts_b] = csv::fields::<4>(line)?;
+fn parse_fields(f: [Bytes; 4], window: &Window, campaigns: &Table) -> Option<(u64, Bytes, Click)> {
+    let [id, user, campaign, ts_b] = f;
     if id.is_empty() || user.is_empty() {
         return None;
     }
@@ -28,22 +28,39 @@ fn parse_line(line: Bytes, window: &Window, campaigns: &Table) -> Option<(u64, B
     if t < window.start - LOOKBACK_MS || t >= window.end {
         return None;
     }
-    let &campaign = campaigns.index.get(campaign)?;
+    let campaign = campaigns.get(campaign)?;
     Some((data::h64(user), user, Click { person: 0, ts: t, campaign, id }))
 }
 
-/// Every valid click, per worker, split into `PARTS` person partitions.
-pub fn load(dir: &Path, window: &Window, campaigns: &Table, people: &People, threads: usize) -> Vec<Vec<Vec<Click>>> {
+/// Every valid click, per worker, split into `PARTS` user partitions (see [`resolve`]).
+pub fn load(dir: &Path, window: &Window, campaigns: &Table, threads: usize) -> Vec<Vec<Vec<Click>>> {
     let chunks = data::load_dir(dir, 4 << 20);
     data::par_for(
         chunks.len(),
         threads,
         || vec![Vec::<Click>::new(); PARTS],
         |out, i| {
-            for line in csv::lines(chunks[i]) {
-                if let Some((user, user_bytes, mut click)) = parse_line(line, window, campaigns) {
-                    click.person = people.person(user, user_bytes).0;
-                    out[data::part(click.person)].push(click);
+            csv::records::<4>(chunks[i], |f| {
+                if let Some((user, _, mut click)) = parse_fields(f, window, campaigns) {
+                    click.person = user;
+                    out[data::part(user)].push(click);
+                }
+            });
+        },
+    )
+}
+
+/// Re-key clicks from user to person, one user partition at a time.
+pub fn resolve(by_user: &[Vec<Vec<Click>>], people: &People, threads: usize) -> Vec<Vec<Vec<Click>>> {
+    data::par_for(
+        PARTS,
+        threads,
+        || vec![Vec::<Click>::new(); PARTS],
+        |out, u| {
+            for worker in by_user {
+                for c in &worker[u] {
+                    let person = people.person(c.person, c.id).0;
+                    out[data::part(person)].push(Click { person, ..*c });
                 }
             }
         },

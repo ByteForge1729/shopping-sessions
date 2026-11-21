@@ -7,6 +7,7 @@ description = "Exact click-stream sessionization and campaign attribution (Build
 
 [dependencies]
 memmap2 = "0.9"
+memchr = "2"
 parquet = { version = "54", default-features = false }
 
 [profile.release]

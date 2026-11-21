@@ -138,9 +138,31 @@ pub struct Table {
     pub values: Vec<Bytes>,
     pub of_key: Vec<u16>,
     pub keys: Vec<Bytes>,
+    fast: FastMap<u16>,
+}
+
+impl Table {
+    /// Key index of `key`: by its hash, confirmed byte for byte (the SipHash map
+    /// only serves keys whose hash another key already holds).
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Option<u16> {
+        match self.fast.get(&h64(key)) {
+            Some(&i) if self.keys[i as usize] == key => Some(i),
+            _ => self.index.get(key).copied(),
+        }
+    }
 }
 
 pub fn table(path: &Path) -> Table {
+    let t = table_slow(path);
+    let mut fast = FastMap::default();
+    for (i, k) in t.keys.iter().enumerate() {
+        fast.entry(h64(k)).or_insert(i as u16);
+    }
+    Table { fast, ..t }
+}
+
+fn table_slow(path: &Path) -> Table {
     let body = csv::body(map(path));
     let mut index = HashMap::new();
     let mut values: Vec<Bytes> = Vec::new();
@@ -161,7 +183,7 @@ pub fn table(path: &Path) -> Table {
         of_key.push(vid);
         keys.push(key);
     }
-    Table { index, values, of_key, keys }
+    Table { index, values, of_key, keys, fast: FastMap::default() }
 }
 
 pub fn threads() -> usize {

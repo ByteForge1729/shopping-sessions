@@ -1,99 +1,172 @@
 //! Linked IDs: union-find over every valid `links/` line, each person named by the
 //! byte-wise smallest of their IDs. IDs in no valid line are people on their own.
+//!
+//! Everything runs in parallel: IDs are interned per hash partition, unions use a
+//! lock-free union-find (a root always links under the smaller index, so no cycles),
+//! and the result is one small map per partition of user-ID hashes, so a stage that
+//! works on one partition only touches a map that fits in cache.
 
-use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::csv;
-use crate::data::{self, Bytes, FastMap};
+use crate::data::{self, Bytes, FastMap, PARTS};
 
-/// user ID hash -> (person key, person name), for linked IDs only. A person key is
-/// the hash of the person's name, so an unlinked ID's key is its own hash.
+type Shard = FastMap<(u64, Bytes)>;
+
+/// user ID hash -> (person key, person name), for linked IDs only, sharded by
+/// `part(user hash)`. A person key is the hash of the person's name, so an unlinked
+/// ID's key is its own hash.
 pub struct People {
-    map: FastMap<(u64, Bytes)>,
+    shards: Vec<Shard>,
 }
 
 impl People {
     #[inline]
     pub fn person(&self, user_hash: u64, user: Bytes) -> (u64, Bytes) {
-        self.map.get(&user_hash).copied().unwrap_or((user_hash, user))
+        self.shards[data::part(user_hash)].get(&user_hash).copied().unwrap_or((user_hash, user))
     }
 
     pub fn build(dir: &Path, threads: usize) -> People {
         let chunks = data::load_dir(dir, 1 << 20);
-        let pairs = data::par_for(chunks.len(), threads, Vec::new, |out: &mut Vec<(Bytes, Bytes)>, i| {
-            for line in csv::lines(chunks[i]) {
-                if let Some([a, b]) = csv::fields::<2>(line) {
-                    if !a.is_empty() && !b.is_empty() {
-                        out.push((a, b));
+        let parsed = data::par_for(chunks.len(), threads, Parsed::new, |out, i| {
+            csv::records::<2>(chunks[i], |[a, b]| {
+                if !a.is_empty() && !b.is_empty() {
+                    out.add(a, b);
+                }
+            });
+        });
+        let ids = intern(&parsed, threads);
+        let total = ids.base[PARTS] as usize;
+        let parent: Vec<AtomicU32> = (0..total as u32).map(AtomicU32::new).collect();
+        data::par_for(parsed.len(), threads, || (), |_, t| {
+            for &(a, b) in &parsed[t].pairs {
+                unite(&parent, ids.gid(a), ids.gid(b));
+            }
+        });
+        let best: Vec<AtomicU32> = (0..total as u32).map(AtomicU32::new).collect();
+        let names = &ids.names;
+        data::par_for(PARTS, threads, || (), |_, p| {
+            for g in ids.base[p]..ids.base[p + 1] {
+                let root = find(&parent, g) as usize;
+                let mut cur = best[root].load(Ordering::Relaxed);
+                while names[g as usize] < names[cur as usize] {
+                    match best[root].compare_exchange_weak(cur, g, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(seen) => cur = seen,
                     }
                 }
             }
         });
-        let mut uf = UnionFind::default();
-        for (a, b) in pairs.into_iter().flatten() {
-            let (x, y) = (uf.id(a), uf.id(b));
-            uf.union(x, y);
+        let mut shards: Vec<Option<Shard>> = (0..PARTS).map(|_| None).collect();
+        let built = data::par_for(PARTS, threads, Vec::new, |out: &mut Vec<(usize, Shard)>, p| {
+            let mut shard = Shard::default();
+            shard.reserve((ids.base[p + 1] - ids.base[p]) as usize);
+            for g in ids.base[p]..ids.base[p + 1] {
+                let root = find(&parent, g) as usize;
+                let name = names[best[root].load(Ordering::Relaxed) as usize];
+                shard.insert(data::h64(names[g as usize]), (data::h64(name), name));
+            }
+            out.push((p, shard));
+        });
+        for (p, shard) in built.into_iter().flatten() {
+            shards[p] = Some(shard);
         }
-        People { map: uf.people() }
+        People { shards: shards.into_iter().map(Option::unwrap_or_default).collect() }
     }
 }
 
-#[derive(Default)]
-struct UnionFind {
-    index: FastMap<u32>,
+/// One worker's link lines: ID hashes per partition (with their bytes) and pairs.
+struct Parsed {
+    ids: Vec<Vec<(u64, Bytes)>>,
+    pairs: Vec<(u64, u64)>,
+}
+
+impl Parsed {
+    fn new() -> Self {
+        Parsed { ids: vec![Vec::new(); PARTS], pairs: Vec::new() }
+    }
+
+    fn add(&mut self, a: Bytes, b: Bytes) {
+        let (ha, hb) = (data::h64(a), data::h64(b));
+        self.ids[data::part(ha)].push((ha, a));
+        self.ids[data::part(hb)].push((hb, b));
+        self.pairs.push((ha, hb));
+    }
+}
+
+/// Dense global IDs: partition p owns `base[p]..base[p + 1]`.
+struct Ids {
+    base: Vec<u32>,
     names: Vec<Bytes>,
-    parent: Vec<u32>,
+    local: Vec<FastMap<u32>>,
 }
 
-impl UnionFind {
-    fn id(&mut self, name: Bytes) -> u32 {
-        let h = data::h64(name);
-        let next = self.names.len() as u32;
-        *self.index.entry(h).or_insert_with(|| {
-            self.names.push(name);
-            self.parent.push(next);
-            next
-        })
+impl Ids {
+    #[inline]
+    fn gid(&self, h: u64) -> u32 {
+        let p = data::part(h);
+        self.base[p] + self.local[p][&h]
     }
+}
 
-    fn find(&mut self, mut x: u32) -> u32 {
-        let mut root = x;
-        while self.parent[root as usize] != root {
-            root = self.parent[root as usize];
-        }
-        while self.parent[x as usize] != root {
-            let up = self.parent[x as usize];
-            self.parent[x as usize] = root;
-            x = up;
-        }
-        root
-    }
-
-    fn union(&mut self, a: u32, b: u32) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            self.parent[ra.max(rb) as usize] = ra.min(rb);
-        }
-    }
-
-    fn people(mut self) -> FastMap<(u64, Bytes)> {
-        let n = self.names.len();
-        let mut smallest: HashMap<u32, Bytes> = HashMap::new();
-        let roots: Vec<u32> = (0..n as u32).map(|i| self.find(i)).collect();
-        for (i, &root) in roots.iter().enumerate() {
-            let name = self.names[i];
-            let best = smallest.entry(root).or_insert(name);
-            if name < *best {
-                *best = name;
+fn intern(parsed: &[Parsed], threads: usize) -> Ids {
+    let per_part = data::par_for(PARTS, threads, Vec::new, |out: &mut Vec<(usize, FastMap<u32>, Vec<Bytes>)>, p| {
+        let mut map = FastMap::default();
+        let mut names = Vec::new();
+        for worker in parsed {
+            for &(h, name) in &worker.ids[p] {
+                map.entry(h).or_insert_with(|| {
+                    names.push(name);
+                    (names.len() - 1) as u32
+                });
             }
         }
-        let mut out = FastMap::default();
-        out.reserve(n);
-        for (i, &root) in roots.iter().enumerate() {
-            let name = smallest[&root];
-            out.insert(data::h64(self.names[i]), (data::h64(name), name));
+        out.push((p, map, names));
+    });
+    let mut slots: Vec<Option<(FastMap<u32>, Vec<Bytes>)>> = (0..PARTS).map(|_| None).collect();
+    for (p, map, names) in per_part.into_iter().flatten() {
+        slots[p] = Some((map, names));
+    }
+    let mut base = vec![0u32; PARTS + 1];
+    let mut all_names = Vec::new();
+    let mut local = Vec::with_capacity(PARTS);
+    for (p, slot) in slots.into_iter().enumerate() {
+        let (map, names) = slot.unwrap_or_default();
+        base[p + 1] = base[p] + names.len() as u32;
+        all_names.extend(names);
+        local.push(map);
+    }
+    Ids { base, names: all_names, local }
+}
+
+/// Root of `x`, halving the path as it goes (safe under concurrent unions: a parent
+/// pointer only ever moves to a smaller index in the same set).
+#[inline]
+fn find(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Ordering::Relaxed);
+        if p == x {
+            return x;
         }
-        out
+        let gp = parent[p as usize].load(Ordering::Relaxed);
+        if gp != p {
+            let _ = parent[x as usize].compare_exchange_weak(p, gp, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        x = gp;
+    }
+}
+
+#[inline]
+fn unite(parent: &[AtomicU32], a: u32, b: u32) {
+    loop {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra == rb {
+            return;
+        }
+        let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+        if parent[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return;
+        }
     }
 }

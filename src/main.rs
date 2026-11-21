@@ -42,10 +42,13 @@ fn main() {
     let unknown_cat = category_names.len() as u16;
     category_names.push(b"unknown");
     let lookups = events::Lookups { window: &window, products: &products, unknown_cat };
-    let evs = events::load(&data_dir.join("events"), &lookups, &people, threads);
+    let evs = events::load(&data_dir.join("events"), &lookups, threads);
     lap("events");
-    let cls = clicks::load(&data_dir.join("clicks"), &window, &campaigns, &people, threads);
+    let cls = clicks::load(&data_dir.join("clicks"), &window, &campaigns, threads);
     lap("clicks");
+    let evs = events::resolve(&evs, &people, threads);
+    let cls = clicks::resolve(&cls, &people, threads);
+    lap("people");
 
     let mut order: Vec<usize> = (0..category_names.len()).collect();
     order.sort_by_key(|&c| category_names[c]);
@@ -91,4 +94,6 @@ fn main() {
             .expect("write campaign_daily");
     });
     lap("written");
+    // Everything is on disk: skip freeing gigabytes of buffers one by one.
+    std::process::exit(0);
 }

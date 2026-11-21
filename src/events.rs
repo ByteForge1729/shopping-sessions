@@ -14,7 +14,7 @@ pub const PURCHASE: u8 = 2;
 const LATE_MS: i64 = 86_400_000;
 const MAX_PRICE: i64 = 10_000_000;
 
-/// A surviving event, keyed by person.
+/// A surviving event, keyed by person (by user ID hash before [`resolve`]).
 #[derive(Clone, Copy)]
 pub struct Ev {
     pub person: u64,
@@ -57,8 +57,8 @@ fn kind_of(b: &[u8]) -> Option<u8> {
 }
 
 #[inline]
-fn parse_line(line: Bytes, lk: &Lookups) -> Option<Copy> {
-    let [eid, user, ts_b, ingest_b, kind_b, product, price_b] = csv::fields::<7>(line)?;
+fn parse_fields(f: [Bytes; 7], lk: &Lookups) -> Option<Copy> {
+    let [eid, user, ts_b, ingest_b, kind_b, product, price_b] = f;
     if eid.is_empty() {
         return None;
     }
@@ -89,7 +89,7 @@ fn parse_line(line: Bytes, lk: &Lookups) -> Option<Copy> {
             None => return Some(copy),
         }
     }
-    copy.cat = lk.products.index.get(product).map_or(lk.unknown_cat, |&k| lk.products.of_key[k as usize]);
+    copy.cat = lk.products.get(product).map_or(lk.unknown_cat, |k| lk.products.of_key[k as usize]);
     copy.ts = t;
     copy.kind = kind;
     copy.user = data::h64(user);
@@ -112,65 +112,90 @@ fn price(b: &[u8]) -> Option<u32> {
 }
 
 /// Parse, dedup and validate every event; returns, per worker, the survivors split
-/// into `PARTS` person partitions.
-pub fn load(dir: &Path, lk: &Lookups, people: &People, threads: usize) -> Vec<Vec<Vec<Ev>>> {
+/// into `PARTS` user partitions (see [`resolve`]).
+pub fn load(dir: &Path, lk: &Lookups, threads: usize) -> Vec<Vec<Vec<Ev>>> {
+    let clock = std::time::Instant::now();
     let chunks = data::load_dir(dir, 4 << 20);
     let parsed = data::par_for(
         chunks.len(),
         threads,
         || vec![Vec::<Copy>::new(); PARTS],
         |out, i| {
-            for line in csv::lines(chunks[i]) {
-                if let Some(copy) = parse_line(line, lk) {
+            csv::records::<7>(chunks[i], |f| {
+                if let Some(copy) = parse_fields(f, lk) {
                     out[data::part(copy.eid)].push(copy);
                 }
-            }
+            });
         },
     );
+    eprintln!("   events parsed in {:.3}s", clock.elapsed().as_secs_f64());
     data::par_for(
         PARTS,
         threads,
         || vec![Vec::<Ev>::new(); PARTS],
         |out, p| {
-            let mut copies: Vec<Copy> = parsed.iter().flat_map(|t| t[p].iter().copied()).collect();
-            copies.sort_unstable_by_key(|c| (c.eid, c.ingest));
-            let mut i = 0;
-            while i < copies.len() {
-                let mut j = i + 1;
-                while j < copies.len() && copies[j].eid == copies[i].eid {
-                    j += 1;
-                }
-                keep(&mut copies[i..j], people, out);
-                i = j;
+            let flat: Vec<&Copy> = parsed.iter().flat_map(|t| t[p].iter()).collect();
+            for &at in &earliest_copies(&flat) {
+                emit(flat[at as usize], out);
             }
         },
     )
 }
 
-/// One hash run: normally all copies of one event (earliest ingest first). Distinct
-/// IDs that share a hash are separated by their bytes.
-fn keep(run: &mut [Copy], people: &People, out: &mut [Vec<Ev>]) {
-    let first = run[0].eid_bytes;
-    if run.iter().all(|c| c.eid_bytes == first) {
-        emit(&run[0], people, out);
-        return;
-    }
-    run.sort_by(|a, b| (a.eid_bytes, a.ingest).cmp(&(b.eid_bytes, b.ingest)));
-    let mut i = 0;
-    while i < run.len() {
-        emit(&run[i], people, out);
-        let id = run[i].eid_bytes;
-        while i < run.len() && run[i].eid_bytes == id {
-            i += 1;
+const EMPTY: u32 = u32::MAX;
+
+/// Index of the earliest-ingested copy of every distinct event ID, from an
+/// open-addressing table keyed by the ID hash (its low bits; the partition used the
+/// high ones). IDs that share a hash are told apart by their bytes. Copies with
+/// equal `ingest_ts` are identical, so either may be kept.
+fn earliest_copies(flat: &[&Copy]) -> Vec<u32> {
+    let cap = (flat.len() * 2).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut slots: Vec<(u64, u32)> = vec![(0, EMPTY); cap];
+    for (i, c) in flat.iter().enumerate() {
+        let mut s = c.eid as usize & mask;
+        loop {
+            let slot = &mut slots[s];
+            if slot.1 == EMPTY {
+                *slot = (c.eid, i as u32);
+                break;
+            }
+            if slot.0 == c.eid {
+                let kept = flat[slot.1 as usize];
+                if kept.eid_bytes == c.eid_bytes {
+                    if c.ingest < kept.ingest {
+                        slot.1 = i as u32;
+                    }
+                    break;
+                }
+            }
+            s = (s + 1) & mask;
         }
     }
+    slots.into_iter().filter(|s| s.1 != EMPTY).map(|s| s.1).collect()
 }
 
 #[inline]
-fn emit(c: &Copy, people: &People, out: &mut [Vec<Ev>]) {
-    if !c.ok {
-        return;
+fn emit(c: &Copy, out: &mut [Vec<Ev>]) {
+    if c.ok {
+        out[data::part(c.user)].push(Ev { person: c.user, ts: c.ts, price: c.price, cat: c.cat, kind: c.kind, name: c.user_bytes });
     }
-    let (person, name) = people.person(c.user, c.user_bytes);
-    out[data::part(person)].push(Ev { person, ts: c.ts, price: c.price, cat: c.cat, kind: c.kind, name });
+}
+
+/// Re-key events from user to person, one user partition at a time (so only that
+/// partition's slice of the link map is touched), regrouped by person partition.
+pub fn resolve(by_user: &[Vec<Vec<Ev>>], people: &People, threads: usize) -> Vec<Vec<Vec<Ev>>> {
+    data::par_for(
+        PARTS,
+        threads,
+        || vec![Vec::<Ev>::new(); PARTS],
+        |out, u| {
+            for worker in by_user {
+                for e in &worker[u] {
+                    let (person, name) = people.person(e.person, e.name);
+                    out[data::part(person)].push(Ev { person, name, ..*e });
+                }
+            }
+        },
+    )
 }
