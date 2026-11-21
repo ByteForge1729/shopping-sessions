@@ -183,10 +183,10 @@ pub fn run(events: &[Vec<Vec<Ev>>], clicks: &[Vec<Vec<Click>>], d: &Dims, thread
         threads,
         || Worker::new(d),
         |w, q| {
-            let mut evs: Vec<Ev> = events.iter().flat_map(|t| t[q].iter().copied()).collect();
-            evs.sort_unstable_by_key(|e| (e.person, e.ts));
-            let mut cl: Vec<Click> = clicks.iter().flat_map(|t| t[q].iter().copied()).collect();
-            cl.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.get().cmp(b.id.get())));
+            let evs = gather(events.iter().map(|t| &t[q][..]), |e| e.person, |s| s.sort_unstable_by_key(|e| (e.person, e.ts)));
+            let cl = gather(clicks.iter().map(|t| &t[q][..]), |c| c.person, |s| {
+                s.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| a.id.get().cmp(b.id.get())))
+            });
             let (mut i, mut c) = (0, 0);
             while i < evs.len() {
                 let person = evs[i].person;
@@ -207,4 +207,43 @@ pub fn run(events: &[Vec<Vec<Ev>>], clicks: &[Vec<Vec<Click>>], d: &Dims, thread
             }
         },
     )
+}
+
+/// Concatenate `parts`, grouped by the next 8 bits of the person key (the top 8
+/// chose the partition) with a counting sort, then finish each small group with
+/// `sort`: cheaper than one sort of the whole partition, and cache resident.
+fn gather<'a, T: Copy + 'a>(
+    parts: impl Iterator<Item = &'a [T]> + Clone,
+    person: impl Fn(&T) -> u64,
+    sort: impl Fn(&mut [T]),
+) -> Vec<T> {
+    const GROUPS: usize = 256;
+    let group = |x: &T| ((person(x) >> 48) & 0xFF) as usize;
+    let mut start = [0usize; GROUPS + 1];
+    for part in parts.clone() {
+        for x in part {
+            start[group(x) + 1] += 1;
+        }
+    }
+    for g in 0..GROUPS {
+        start[g + 1] += start[g];
+    }
+    let n = start[GROUPS];
+    let mut out: Vec<T> = Vec::with_capacity(n);
+    let mut at = start;
+    let dst = out.as_mut_ptr();
+    for part in parts {
+        for x in part {
+            let g = group(x);
+            // SAFETY: at[g] < start[g + 1] <= n, and every slot is written exactly once.
+            unsafe { dst.add(at[g]).write(*x) };
+            at[g] += 1;
+        }
+    }
+    // SAFETY: all n slots were written above.
+    unsafe { out.set_len(n) };
+    for g in 0..GROUPS {
+        sort(&mut out[start[g]..start[g + 1]]);
+    }
+    out
 }

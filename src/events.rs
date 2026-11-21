@@ -134,9 +134,9 @@ pub fn load(dir: &Path, lk: &Lookups, threads: usize) -> Vec<Vec<Vec<Ev>>> {
         threads,
         || vec![Vec::<Ev>::new(); PARTS],
         |out, p| {
-            let flat: Vec<&Copy> = parsed.iter().flat_map(|t| t[p].iter()).collect();
-            for &at in &earliest_copies(&flat) {
-                emit(flat[at as usize], out);
+            let lists: Vec<&[Copy]> = parsed.iter().map(|t| &t[p][..]).collect();
+            for at in earliest_copies(&lists) {
+                emit(&lists[(at >> 24) as usize][(at & 0xFF_FFFF) as usize], out);
             }
         },
     )
@@ -144,35 +144,41 @@ pub fn load(dir: &Path, lk: &Lookups, threads: usize) -> Vec<Vec<Vec<Ev>>> {
 
 const EMPTY: u32 = u32::MAX;
 
-/// Index of the earliest-ingested copy of every distinct event ID, from an
-/// open-addressing table keyed by the ID hash (its low bits; the partition used the
-/// high ones). IDs that share a hash are told apart by their bytes. Copies with
-/// equal `ingest_ts` are identical, so either may be kept.
-fn earliest_copies(flat: &[&Copy]) -> Vec<u32> {
-    let cap = (flat.len() * 2).next_power_of_two().max(16);
+/// (list << 24 | index) of the earliest-ingested copy of every distinct event ID,
+/// from an open-addressing table keyed by the ID hash (its low bits; the partition
+/// used the high ones). IDs that share a hash are told apart by their bytes. Copies
+/// with equal `ingest_ts` are identical, so either may be kept.
+fn earliest_copies(lists: &[&[Copy]]) -> impl Iterator<Item = u32> {
+    let total: usize = lists.iter().map(|l| l.len()).sum();
+    let cap = (total * 2).next_power_of_two().max(16);
     let mask = cap - 1;
     let mut slots: Vec<(u64, u32)> = vec![(0, EMPTY); cap];
-    for (i, c) in flat.iter().enumerate() {
-        let mut s = c.eid as usize & mask;
-        loop {
-            let slot = &mut slots[s];
-            if slot.1 == EMPTY {
-                *slot = (c.eid, i as u32);
-                break;
-            }
-            if slot.0 == c.eid {
-                let kept = flat[slot.1 as usize];
-                if kept.eid_bytes == c.eid_bytes || kept.eid_bytes.get() == c.eid_bytes.get() {
-                    if c.ingest < kept.ingest {
-                        slot.1 = i as u32;
-                    }
+    let copy = |at: u32| &lists[(at >> 24) as usize][(at & 0xFF_FFFF) as usize];
+    for (t, list) in lists.iter().enumerate() {
+        assert!(list.len() < 1 << 24 && t < 255, "partition too large for slot packing");
+        for (i, c) in list.iter().enumerate() {
+            let me = (t as u32) << 24 | i as u32;
+            let mut s = c.eid as usize & mask;
+            loop {
+                let slot = &mut slots[s];
+                if slot.1 == EMPTY {
+                    *slot = (c.eid, me);
                     break;
                 }
+                if slot.0 == c.eid {
+                    let kept = copy(slot.1);
+                    if kept.eid_bytes == c.eid_bytes || kept.eid_bytes.get() == c.eid_bytes.get() {
+                        if c.ingest < kept.ingest {
+                            slot.1 = me;
+                        }
+                        break;
+                    }
+                }
+                s = (s + 1) & mask;
             }
-            s = (s + 1) & mask;
         }
     }
-    slots.into_iter().filter(|s| s.1 != EMPTY).map(|s| s.1).collect()
+    slots.into_iter().filter(|s| s.1 != EMPTY).map(|s| s.1)
 }
 
 #[inline]
